@@ -1,16 +1,36 @@
 [project]
 name = "voice-engine"
-version = "0.1.0"
+version = "0.2.0"
+description = "Pluggable realtime voice gateway (Deepgram STT / Deepgram Aura TTS) with an SDK for adding listen + speak to any AI project."
+readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    # Minimal core runtime of the SDK (voice_engine.client) so consumer AI
+    # projects can install this package without pulling in the server stack.
+    "httpx>=0.24.0",
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+# Voice-gateway server stack (FastAPI app + provider implementations).
+server = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.22.0",
-    "websockets>=11.0",
     "anyio>=4.0",
     "pydantic>=2.5",
-    "pytest>=7.0",
-    "pytest-asyncio>=0.23.0",
     "python-dotenv>=1.0.1",
-    "httpx>=0.24.0",
     "edge-tts>=6.1.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["voice_engine"]

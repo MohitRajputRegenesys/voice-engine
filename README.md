@@ -1,116 +1,123 @@
-# Voice Engine — Realtime conversational voice runtime
+# Voice Engine — drop-in **listen + speak** layer for any AI project
 
-Shared **STT / TTS** module powering speech + listen for the **AI Facilitator**
-chatbot. Implements a production-oriented session/state machine, bounded
-queues, cancellation/barge-in handling, and pluggable providers.
+A small realtime voice runtime that adds speech I/O around *your* AI brain.
+It exposes a WebSocket gateway + one-shot REST endpoints backed by pluggable
+providers — **Deepgram** for STT *and* TTS (Aura) by default, with mocks for
+zero-config development and free Edge-TTS as an opt-in fallback.
 
-## Providers
-
-| Layer | Default (mock) | Real (opt-in) |
-|-------|----------------|---------------|
-| **STT** | `MockSTTProvider` | `DeepgramSTTProvider` (needs `DEEPGRAM_API_KEY`) |
-| **LLM** | `MockLLMProvider` | `FacilitatorLLMProvider` → calls the AI Facilitator `/api/chat` (RAG) |
-| **TTS** | `MockTTSProvider` | `EdgeTTSProvider` (free Microsoft Edge TTS, no key) |
-
-Provider selection is driven by environment variables — see `.env.example`.
-
-## Setup (uv)
-
-```bash
-cp .env.example .env   # then fill in keys you want to enable
-uv sync
+```
+mic ──PCM16 16kHz──►  /ws or /stt ──► transcript.final ──► YOUR AI ──► speak(text)
+                                                                    ◄── audio.chunk (MP3)
 ```
 
-## Run the voice gateway (port 8001)
+## Two integration modes
+
+| Mode | Best for | API |
+|------|----------|-----|
+| **Realtime duplex** | streaming UX, partial transcripts, barge-in | `VoiceClient` over `/ws` |
+| **One-shot REST** | simplest wiring from any language/framework | `POST /stt`, `POST /tts` |
+
+### Providers
+
+| Layer | Auto-selected real backend | Mock (default when no keys) | Opt-in |
+|-------|---------------------------|------------------------------|--------|
+| **STT** | `DeepgramSTTProvider` (WS streaming, needs `DEEPGRAM_API_KEY`) | `MockSTTProvider` | — |
+| **TTS** | `DeepgramTTSProvider` (**Deepgram Aura**, same key) | `MockTTSProvider` | `EdgeTTSProvider` (`TTS_PROVIDER=edge`, free) |
+| **LLM brain** | yours (see modes below) | `MockLLMProvider` | optional HTTP adapter (`FacilitatorLLMProvider`) |
+
+Selection lives in one place: `voice_engine/providers.py::build_stt_provider()`
+and `build_tts_provider()` — see `.env.example` for every knob.
+
+## Install
+
+```bash
+pip install git+https://github.com/<you>/voice-engine.git            # SDK only (client)
+pip install "git+https://github.com/<you>/voice-engine.git[server]" # incl. gateway
+```
+
+Local development with [uv](https://docs.astral.sh/uv/):
+
+```bash
+cp .env.example .env    # add your DEEPGRAM_API_KEY
+uv sync --all-extras
+```
+
+## Run the gateway (port 8001)
 
 ```bash
 uv run uvicorn voice_engine.server:app --port 8001 --reload
 ```
 
-> Port 8001 is used so the voice gateway
-> backend, which runs on 8000.
-
-## Exercise the mocked flow
+Check your live setup end-to-end (TTS + optional STT on a WAV):
 
 ```bash
-uv run python example_client.py
+uv run python smoke_live.py              # synthesizes smoke_tts.mp3 via configured TTS
+uv run python smoke_live.py sample.wav   # also transcribes a 16k mono PCM16 WAV
+uv run python probe_stt_ws.py            # verifies Deepgram WS auth / model / language
 ```
 
-The client opens `ws://localhost:8001/ws`, sends audio frames + an `<end>`
-marker, and prints the `transcript.partial` / `transcript.final` →
-`llm.delta` → `audio.chunk` events.
+## Mode 1 — bring your own AI (realtime)
 
-## WebSocket protocol
-
-**Client → server**
-- `{"type":"audio","data":"<end>"}` — mark end of utterance (finalize STT)
-- `{"type":"audio","data":"<base64 raw PCM16 16kHz>"}` — real audio frame
-- `{"type":"audio","data":"text"}` — demo text frame (mock path)
-
-**Server → client**
-- `transcript.partial` / `transcript.final` — live + committed user speech
-- `llm.delta` — streaming LLM (facilitator) text
-- `audio.chunk` — `data` is base64 MP3 audio to play back (TTS)
-- `ping` / `pong` — heartbeat
-
-## Wiring into the AI Facilitator
-
-1. Start the facilitator backend on `http://localhost:8000` (its `/api/chat`
-   becomes the voice pipeline's brain via `FacilitatorLLMProvider`).
-2. Run this voice gateway on `8001`.
-3. Enable real speech in `.env`:
-   - `DEEPGRAM_API_KEY=...` for real listening
-   - `TTS_PROVIDER=edge` for real speaking
-   - (leave `FACILITATOR_API_URL=http://localhost:8000` to answer from the RAG)
-4. The facilitator's Next.js frontend connects to `ws://localhost:8001/ws` —
-   the mic streams audio there, and returning `audio.chunk` is played aloud.
-
-## Using it as a "voice layer" for your own AI project
-
-The engine can be used as just **listen + speak** for an AI project that already
-has its own brain (i.e. no facilitator). Connect with `?auto_llm=0` so the engine
-does STT only and lets **your** AI decide the answer; push that answer back and the
-engine speaks it. The `VoiceClient` SDK (`voice_engine.client`) hides the protocol.
+The engine listens, streams `transcript.final` events, and speaks whatever
+**your** model decides — it never answers by itself when you connect with
+`?auto_llm=0`. The `VoiceClient` SDK hides the protocol:
 
 ```python
 import asyncio
 from voice_engine.client import VoiceClient
 
 async def run():
-    async with VoiceClient() as vc:                       # ws://.../ws?auto_llm=0
-        await vc.send_audio(audio_bytes)                  # your mic (PCM16 16kHz)
-        await vc.end_utterance()                          # finalize STT
+    async with VoiceClient() as vc:                     # ws://localhost:8001/ws?auto_llm=0
+        await vc.send_audio(mic_pcm16_16khz_frame())    # stream user speech
+        await vc.end_utterance()                        # finalize STT
         async for msg in vc.messages():
             if msg.get("type") == "transcript.final":
-                answer = await my_model.generate(msg["text"])   # YOUR AI
+                answer = await my_model.generate(msg["text"])   # YOUR AI here
                 await vc.speak(answer)                          # engine speaks it
+                await vc.read_speech()                          # consume MP3 chunks until done
+
+asyncio.run(run())
 ```
 
-Run a full working demo: `uv run python external_ai_example.py`.
+Full runnable demo: `uv run python external_ai_example.py`
+(engine-own-LLM demo: `example_client.py`).
 
-### One-shot REST (no WebSocket) — easiest for any language/framework
+### One-shot REST (any language/framework)
 
-- `POST /stt` — `{"data":"<base64 PCM16 16kHz audio>", "encoding":"base64"}` →
-  `{"text":"recognized transcript"}` (with `"encoding":"text"` it echoes a mock
-  transcript). Real STT needs `DEEPGRAM_API_KEY`.
-- `POST /tts` — `{"text":"hello"}` → raw audio bytes
-  (`audio/mpeg` when `TTS_PROVIDER=edge`, else `application/octet-stream`).
+```bash
+curl -X POST localhost:8001/tts -H 'Content-Type: application/json' \
+     -d '{"text":"hello"}' -o hello.mp3        # audio/mpeg via Aura
 
-Client helpers: `await transcribe(...)` and `await synthesize(...)` (HTTP).
+curl -X POST localhost:8001/stt -H 'Content-Type: application/json' \
+     -d '{"data":"<base64 PCM16 16kHz>","encoding":"base64"}'
+```
 
-### WebSocket protocol (new messages)
+Python helpers: `from voice_engine.client import transcribe, synthesize`.
 
-- **Client → server**: `{"type":"speak","data":"<text>"}` — external AI asks the
-  engine to speak arbitrary text (TTS + `audio.chunk` back).
-- **Server → client**: `speak.done` — emitted when an external `speak` turn ends.
+## WebSocket protocol
 
-The existing `audio`/`transcript`/`llm.delta`/`audio.chunk` messages are unchanged,
-so the facilitator flow and the external-AI flow share the same pipeline.
+**Client → server**
+- `{"type":"audio","data":"<end>"}` — end of utterance (finalize STT)
+- `{"type":"audio","data":"<base64 raw PCM16 16kHz>"}` — audio frame
+- `{"type":"speak","data":"<text>"}` — external AI drives a spoken turn
+- `{"type":"ping"}` → `"pong"`
+
+**Server → client**
+- `transcript.partial` / `transcript.final` — live + committed user speech
+- `llm.delta` — streamed answer text (only in auto-LLM mode)
+- `audio.chunk` — base64 MP3 to play back
+- `speak.done` — end of an externally-driven spoken turn
+- `ping` heartbeat every 10 s (ignore if not needed)
+
+Barge-in: sending audio while the engine is speaking cancels the current utterance.
 
 ## Tests
 
 ```bash
-.venv\Scripts\python -m pytest -q
+uv run pytest -q
 ```
+
+Unit tests are fully mocked (no network/key required); use `smoke_live.py` to
+verify your real credentials.
 
 
