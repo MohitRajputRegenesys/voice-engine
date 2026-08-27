@@ -1,8 +1,0 @@
-STT_PROVIDER=deepgram            
-STT_MODEL=nova-2
-DEEPGRAM_API_KEY=3902577ed50a4540ee7d2566f234773bd8e04f2f
-
-TTS_PROVIDER=elevenlabs          
-ELEVENLABS_API_KEY=sk_548877fb847aeb2c5a73eb2fa351a2a54559b33bbc642d91
-ELEVENLABS_VOICE_ID=21m00Tcm4TlvDq8ikWAM   # Rachel (default)
-TTS_MODEL=eleven_turbo_v2_5

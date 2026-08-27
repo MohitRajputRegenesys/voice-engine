@@ -1,11 +1,15 @@
 """FastAPI WebSocket server exposing realtime voice session endpoint."""
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.responses import HTMLResponse, Response
+from pydantic import BaseModel
 from dotenv import load_dotenv
 import asyncio
+import base64
+import os
 from pathlib import Path
 from .session import Session
 from .state import SessionState
+from .rest import transcribe_once, synthesize_once
 
 for env_path in (Path(__file__).resolve().parent.parent / ".env", Path(__file__).resolve().parent.parent / "env"):
     if env_path.exists():
@@ -16,15 +20,65 @@ app = FastAPI()
 connections = {}
 
 
+class TranscribeRequest(BaseModel):
+    # For `encoding="text"` the payload is echoed back as the transcript (demo/mock
+    # path). For `encoding="base64"` it is raw PCM16 16kHz audio for real STT.
+    data: str
+    encoding: str = "text"
+
+
+class TTSRequest(BaseModel):
+    text: str
+
+
 @app.get("/")
 async def index():
     return HTMLResponse("""<html><body>Voice Engine WebSocket endpoint at /ws</body></html>""")
 
 
+@app.post("/stt")
+async def one_shot_stt(req: TranscribeRequest):
+    """One-shot speech-to-text for external AI projects.
+
+    `POST /stt` {"data":"<base64 audio or plain text>", "encoding":"text|base64"}
+    -> {"text": "recognized transcript"}
+    """
+    if req.encoding in ("base64", "audio"):
+        try:
+            raw = base64.b64decode(req.data, validate=False)
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid base64 payload")
+        text = await transcribe_once(raw)
+    else:
+        text = req.data  # echo path for mock/demo flows
+    return {"text": text, "encoding": "text"}
+
+
+@app.post("/tts")
+async def one_shot_tts(req: TTSRequest):
+    """One-shot text-to-speech for external AI projects.
+
+    `POST /tts` {"text":"hello"} -> raw audio bytes.
+    Content type is `audio/mpeg` when TTS_PROVIDER=edge, otherwise `application/octet-stream`.
+    """
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="text cannot be empty")
+    audio = await synthesize_once(req.text)
+    _prov = os.environ.get("TTS_PROVIDER", "").lower()
+    media_type = "audio/mpeg" if _prov in ("edge", "edge-tts") else "application/octet-stream"
+    return Response(content=bytes(audio), media_type=media_type)
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    session = Session(ws)
+    # `?auto_llm=0` → external client drives the response via speak(); default keeps
+    # the configured facilitator LLM auto-answering.
+    auto_llm_param = ws.query_params.get("auto_llm")
+    auto_llm = True
+    if auto_llm_param is not None and auto_llm_param.lower() in ("0", "false", "no", "off"):
+        auto_llm = False
+    session = Session(ws, auto_llm=auto_llm)
     await session.start()
     connections[session.id] = session
 
@@ -41,17 +95,27 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
             typ = msg.get("type")
             if typ == "audio":
-                # client sends base64 or marker; for mocked flows accept marker <end>
+                # client sends base64-encoded raw PCM (real STT) or a marker;
+                # for mocked/demo flows we also accept plain text frames.
                 data = msg.get("data")
                 if data == "<end>":
                     await session.post_audio(b"<end>")
                 else:
-                    await session.post_audio(data.encode("utf-8"))
+                    try:
+                        raw = base64.b64decode(data, validate=False)
+                        await session.post_audio(raw)
+                    except Exception:
+                        await session.post_audio(str(data).encode("utf-8"))
                 # if receiving audio while speaking, that's a barge-in
                 if session.state.state == SessionState.SPEAKING:
                     session.metrics.interruption_count += 1
                     if session.active_response_cancel:
                         session.active_response_cancel.set()
+            elif typ == "speak":
+                # External AI drives the response: synthesize and speak this text.
+                text = str(msg.get("data", ""))
+                if text.strip():
+                    await session.speak(text)
             elif typ == "close":
                 break
             elif typ == "ping":

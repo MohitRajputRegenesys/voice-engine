@@ -7,7 +7,7 @@ import os
 import json
 import logging
 import websockets
-from websockets import ConnectionClosedError
+from websockets import ConnectionClosed, ConnectionClosedError
 
 
 class STTEvent:
@@ -93,6 +93,123 @@ class MockTTSProvider(BaseTTSProvider):
             seq += 1
 
 
+def _chunk_text(text: str, size: int = 120) -> list:
+    """Split text into reasonably sized word chunks for streaming deltas."""
+    text = text.strip()
+    if not text:
+        return [""]
+    words = text.split()
+    chunks: list = []
+    cur = ""
+    for w in words:
+        if cur and len(cur) + len(w) + 1 > size:
+            chunks.append(cur)
+            cur = w
+        else:
+            cur = (cur + " " + w).strip()
+    if cur:
+        chunks.append(cur)
+    return chunks or [""]
+
+
+class FacilitatorLLMProvider(BaseLLMProvider):
+    """LLM provider backed by the AI Facilitator's RAG `/api/chat` endpoint.
+
+    Instead of a canned mock reply, this sends the user's transcript to the
+    facilitator backend, retrieves a grounded teacher answer, and streams it
+    back as sentence-level `LLMDelta` objects. Conversational history is kept
+    so multi-turn context is preserved across questions.
+    """
+
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8000",
+        top_k: int = 5,
+        alpha: float = 0.5,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.top_k = top_k
+        self.alpha = alpha
+        self.history: list = []
+        self.logger = logging.getLogger("FacilitatorLLMProvider")
+        self._client: Optional[Any] = None  # httpx.AsyncClient, created lazily
+
+    def _get_client(self):
+        import httpx
+
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=60.0)
+        return self._client
+
+    async def stream_response(self, prompt: str, response_id: str) -> AsyncIterator[LLMDelta]:
+        import httpx
+
+        payload = {
+            "question": prompt,
+            "top_k": self.top_k,
+            "alpha": self.alpha,
+            "conversation_history": self.history,
+        }
+        if self._get_client() is None:
+            return
+        resp = await self._get_client().post(f"{self.base_url}/api/chat", json=payload)
+        if resp.status_code != 200:
+            self.logger.error("Facilitator /api/chat returned %s: %s", resp.status_code, resp.text)
+            yield LLMDelta(
+                response_id=response_id,
+                sequence=0,
+                text="I'm sorry, I could not retrieve an answer right now.",
+            )
+            return
+        data = resp.json()
+        answer = data.get("answer", "") or ""
+        # commit the turn to the conversation history
+        self.history.append({"role": "student", "content": prompt})
+        self.history.append({"role": "teacher", "content": answer})
+        # stream as small deltas for a natural token-like flow
+        for seq, piece in enumerate(_chunk_text(answer)):
+            await asyncio.sleep(0.05)
+            yield LLMDelta(response_id=response_id, sequence=seq, text=piece)
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            try:
+                await self._client.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+            self._client = None
+
+
+class EdgeTTSProvider(BaseTTSProvider):
+    """TTS provider using Microsoft Edge TTS (free, no API key required).
+
+    Accumulates the streamed answer text, synthesizes it to MP3 audio via
+    `edge-tts`, and yields the resulting audio as a single `AudioChunk`.
+    """
+
+    def __init__(self, voice: str = "en-US-AriaNeural", rate: str = "+0%", volume: str = "+0%"):
+        self.voice = voice
+        self.rate = rate
+        self.volume = volume
+
+    async def synthesize(self, text_iter: AsyncIterator[str], response_id: str) -> AsyncIterator[AudioChunk]:
+        from edge_tts import Communicate  # lazy import keeps optional dependency
+
+        parts = []
+        async for chunk in text_iter:
+            parts.append(chunk)
+        text = "".join(parts).strip()
+        if not text:
+            return
+        communicate = Communicate(text, voice=self.voice, rate=self.rate, volume=self.volume)
+        audio = bytearray()
+        async for message in communicate.stream():
+            if message["type"] == "audio":
+                audio.extend(message["data"])
+        if audio:
+            yield AudioChunk(response_id=response_id, sequence=0, data=bytes(audio))
+
+
 class DeepgramSTTProvider(BaseSTTProvider):
     """Deepgram realtime STT provider using WebSocket. Requires DEEPGRAM_API_KEY env var.
 
@@ -116,17 +233,28 @@ class DeepgramSTTProvider(BaseSTTProvider):
         sequence = 0
         while True:
             try:
-                headers = [("Authorization", f"Token {self.api_key}")]
-                async with websockets.connect(url, extra_headers=headers, ping_interval=20) as ws:
+                headers = {"Authorization": f"Token {self.api_key}"}
+                async with websockets.connect(url, additional_headers=headers, ping_interval=20) as ws:
                     self.logger.info("Deepgram websocket connected")
 
                     async def sender():
                         while True:
                             data = await audio_queue.get()
                             if data is None:
+                                try:
+                                    await ws.send(json.dumps({"type": "CloseStream"}))
+                                except Exception:
+                                    pass
                                 return
                             if data == b"<end>":
-                                continue
+                                # Deterministic finalization: ask Deepgram to wrap
+                                # up the current stream so a final transcript is
+                                # emitted promptly (instead of waiting on silence).
+                                try:
+                                    await ws.send(json.dumps({"type": "CloseStream"}))
+                                except ConnectionClosedError:
+                                    pass
+                                return
                             try:
                                 await ws.send(data)
                             except ConnectionClosedError:
@@ -170,6 +298,11 @@ class DeepgramSTTProvider(BaseSTTProvider):
                             await send_task
                         except asyncio.CancelledError:
                             pass
+            except ConnectionClosed:
+                # Normal end-of-stream after CloseStream; reconnect quietly for
+                # the next utterance rather than logging a scary traceback.
+                await asyncio.sleep(0.5)
+                continue
             except Exception as exc:
                 self.logger.exception("Deepgram connection failed: %s", exc)
                 await asyncio.sleep(backoff)
