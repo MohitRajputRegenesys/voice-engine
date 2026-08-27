@@ -7,16 +7,15 @@ import base64
 from typing import Optional, Dict, Any, AsyncIterator, List
 from .state import StateMachine, SessionState, InvalidTransition
 from .providers import (
-    MockSTTProvider,
     MockLLMProvider,
-    MockTTSProvider,
     STTEvent,
     LLMDelta,
     AudioChunk,
-    DeepgramSTTProvider,
     FacilitatorLLMProvider,
-    EdgeTTSProvider,
+    build_stt_provider,
+    build_tts_provider,
 )
+
 import os
 
 
@@ -43,17 +42,14 @@ class Session:
         # STT and emits `transcript.final`; an external client drives the response
         # by calling `speak(...)`. This is the "just add voice to my own AI" mode.
         self.auto_llm = auto_llm
-        # Prefer explicit provider, then Deepgram if configured, otherwise mock
+        # Prefer explicit providers, then environment-driven factories so the
+        # realtime path and REST endpoints always agree on configuration.
         if stt_provider:
             self.stt_provider = stt_provider
-        elif os.environ.get("DEEPGRAM_API_KEY"):
-            self.stt_provider = DeepgramSTTProvider(
-                model=os.environ.get("STT_MODEL", "nova-2-general") or "nova-2-general"
-            )
         else:
-            self.stt_provider = MockSTTProvider()
+            self.stt_provider = build_stt_provider()
 
-        # LLM: explicit > facilitator (RAG) if configured > mock
+        # LLM: explicit > optional external-brain adapter if configured > mock
         if llm_provider:
             self.llm_provider = llm_provider
         elif os.environ.get("FACILITATOR_API_URL"):
@@ -65,17 +61,11 @@ class Session:
         else:
             self.llm_provider = MockLLMProvider()
 
-        # TTS: explicit > edge-tts > mock (driven by TTS_PROVIDER)
+        # TTS: explicit > factory (deepgram auto / edge opt-in / mock)
         if tts_provider:
             self.tts_provider = tts_provider
         else:
-            _prov = os.environ.get("TTS_PROVIDER", "").lower()
-            if _prov in ("edge", "edge-tts"):
-                self.tts_provider = EdgeTTSProvider(
-                    voice=os.environ.get("TTS_VOICE", "en-US-AriaNeural")
-                )
-            else:
-                self.tts_provider = MockTTSProvider()
+            self.tts_provider = build_tts_provider()
 
         # Conversation history retained for the facilitator LLM provider
         self.conversation_history: List[Dict[str, str]] = []

@@ -5,10 +5,10 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import asyncio
 import base64
-import os
 from pathlib import Path
 from .session import Session
 from .state import SessionState
+from .providers import build_tts_provider
 from .rest import transcribe_once, synthesize_once
 
 for env_path in (Path(__file__).resolve().parent.parent / ".env", Path(__file__).resolve().parent.parent / "env"):
@@ -58,15 +58,14 @@ async def one_shot_stt(req: TranscribeRequest):
 async def one_shot_tts(req: TTSRequest):
     """One-shot text-to-speech for external AI projects.
 
-    `POST /tts` {"text":"hello"} -> raw audio bytes.
-    Content type is `audio/mpeg` when TTS_PROVIDER=edge, otherwise `application/octet-stream`.
+    `POST /tts` {"text":"hello"} -> raw audio bytes. The media type reflects the
+    configured provider (`audio/mpeg` for Deepgram Aura / Edge MP3 output).
     """
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="text cannot be empty")
-    audio = await synthesize_once(req.text)
-    _prov = os.environ.get("TTS_PROVIDER", "").lower()
-    media_type = "audio/mpeg" if _prov in ("edge", "edge-tts") else "application/octet-stream"
-    return Response(content=bytes(audio), media_type=media_type)
+    tts_provider = build_tts_provider()
+    audio = await synthesize_once(req.text, tts_provider=tts_provider)
+    return Response(content=bytes(audio), media_type=getattr(tts_provider, "media_type", "application/octet-stream"))
 
 
 @app.websocket("/ws")

@@ -7,7 +7,9 @@ import os
 import json
 import logging
 import websockets
+from urllib.parse import urlencode
 from websockets import ConnectionClosed, ConnectionClosedError
+from websockets.exceptions import InvalidStatus
 
 
 class STTEvent:
@@ -78,6 +80,10 @@ class MockLLMProvider(BaseLLMProvider):
 
 
 class BaseTTSProvider:
+    # Content type describing bytes returned by `synthesize`; used by the REST
+    # /tts endpoint so clients know how to play the payload.
+    media_type = "application/octet-stream"
+
     async def synthesize(self, text_iter: AsyncIterator[str], response_id: str) -> AsyncIterator[AudioChunk]:
         raise NotImplementedError()
 
@@ -187,6 +193,8 @@ class EdgeTTSProvider(BaseTTSProvider):
     `edge-tts`, and yields the resulting audio as a single `AudioChunk`.
     """
 
+    media_type = "audio/mpeg"
+
     def __init__(self, voice: str = "en-US-AriaNeural", rate: str = "+0%", volume: str = "+0%"):
         self.voice = voice
         self.rate = rate
@@ -210,6 +218,112 @@ class EdgeTTSProvider(BaseTTSProvider):
             yield AudioChunk(response_id=response_id, sequence=0, data=bytes(audio))
 
 
+class DeepgramTTSProvider(BaseTTSProvider):
+    """TTS provider using Deepgram's Aura voices (REST /v1/speak endpoint).
+
+    Streams MP3 audio back for the given text. Aura models accept up to 2000
+    characters per request, so longer text is word-packed into segments below
+    that limit and each synthesized segment is yielded as its own AudioChunk.
+    """
+
+    media_type = "audio/mpeg"
+    API_URL = "https://api.deepgram.com/v1/speak"
+    MAX_CHARS = 2000
+
+    def __init__(self, model: Optional[str] = None):
+        self.api_key = os.environ.get("DEEPGRAM_API_KEY")
+        self.model = model or os.environ.get("TTS_MODEL", "") or "aura-2-thalia-en"
+        self.logger = logging.getLogger("DeepgramTTSProvider")
+        if not self.api_key:
+            raise RuntimeError("DEEPGRAM_API_KEY not set in environment")
+
+    async def _synthesize_segment(self, client: Any, text: str) -> Optional[bytes]:
+        resp = await client.post(
+            self.API_URL,
+            params={"model": self.model},
+            headers={
+                "Authorization": f"Token {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"text": text},
+        )
+        if resp.status_code != 200:
+            self.logger.error("Deepgram TTS returned %s: %s", resp.status_code, resp.text[:300])
+            return None
+        return resp.content
+
+    async def synthesize(self, text_iter: AsyncIterator[str], response_id: str) -> AsyncIterator[AudioChunk]:
+        import httpx
+
+        parts = []
+        async for chunk in text_iter:
+            parts.append(chunk)
+        text = "".join(parts).strip()
+        if not text:
+            return
+
+        # Respect Aura's per-request character limit.
+        if len(text) <= self.MAX_CHARS:
+            segments = [text]
+        else:
+            segments = [s for s in _chunk_text(text, size=self.MAX_CHARS - 200) if s.strip()]
+
+        seq = 0
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for segment in segments:
+                try:
+                    audio = await self._synthesize_segment(client, segment)
+                except httpx.HTTPError as exc:
+                    self.logger.error("Deepgram TTS request failed: %s", exc)
+                    continue
+                if audio:
+                    yield AudioChunk(response_id=response_id, sequence=seq, data=audio)
+                    seq += 1
+
+
+def build_stt_provider():
+    """Select the STT backend from environment configuration.
+
+    DEEPGRAM_API_KEY set -> Deepgram streaming STT; otherwise mock.
+    """
+    if os.environ.get("DEEPGRAM_API_KEY"):
+        return DeepgramSTTProvider(
+            model=os.environ.get("STT_MODEL", "nova-2") or "nova-2",
+            language=os.environ.get("STT_LANGUAGE") or None,
+            sample_rate=int(os.environ.get("STT_SAMPLE_RATE", "16000") or 16000),
+        )
+    return MockSTTProvider()
+
+
+def build_tts_provider():
+    """Select the TTS backend from environment configuration.
+
+    Priority:
+      - TTS_PROVIDER="deepgram" -> Deepgram Aura (requires DEEPGRAM_API_KEY)
+      - TTS_PROVIDER="edge"     -> free Microsoft Edge TTS
+      - TTS_PROVIDER=""         -> auto: Deepgram Aura when the key is present,
+                                   otherwise mock (no vendor lock-in, no cost)
+    """
+    prov = os.environ.get("TTS_PROVIDER", "").strip().lower()
+    deepgram_key = os.environ.get("DEEPGRAM_API_KEY")
+
+    if prov == "":
+        if deepgram_key:
+            return DeepgramTTSProvider()
+        return MockTTSProvider()
+
+    if prov in ("deepgram", "deepgram-tts", "aura"):
+        if not deepgram_key:
+            raise RuntimeError("TTS_PROVIDER=deepgram requires DEEPGRAM_API_KEY")
+        return DeepgramTTSProvider(model=os.environ.get("TTS_MODEL") or None)
+
+    if prov in ("edge", "edge-tts"):
+        return EdgeTTSProvider(voice=os.environ.get("TTS_VOICE", "en-US-AriaNeural"))
+
+    logging.getLogger(__name__).warning("Unknown TTS_PROVIDER=%r, falling back to mock", prov)
+    return MockTTSProvider()
+
+
 class DeepgramSTTProvider(BaseSTTProvider):
     """Deepgram realtime STT provider using WebSocket. Requires DEEPGRAM_API_KEY env var.
 
@@ -217,9 +331,10 @@ class DeepgramSTTProvider(BaseSTTProvider):
     and yields `STTEvent` objects for partial and final transcripts. It supports
     reconnection with backoff and cleans up on queue termination (None).
     """
-    def __init__(self, model: str = "general/enhanced", sample_rate: int = 16000):
+    def __init__(self, model: str = "nova-2", language: Optional[str] = None, sample_rate: int = 16000):
         self.api_key = os.environ.get("DEEPGRAM_API_KEY")
         self.model = model
+        self.language = language
         self.sample_rate = sample_rate
         self.logger = logging.getLogger("DeepgramSTTProvider")
 
@@ -227,7 +342,15 @@ class DeepgramSTTProvider(BaseSTTProvider):
         if not self.api_key:
             raise RuntimeError("DEEPGRAM_API_KEY not set in environment")
 
-        url = f"wss://api.deepgram.com/v1/listen?model={self.model}&encoding=linear16&sample_rate={self.sample_rate}"
+        params = {
+            "model": self.model,
+            "encoding": "linear16",
+            "sample_rate": str(self.sample_rate),
+            "smart_format": "true",
+        }
+        if self.language:
+            params["language"] = self.language
+        url = "wss://api.deepgram.com/v1/listen?" + urlencode(params)
 
         backoff = 1.0
         sequence = 0
@@ -303,6 +426,11 @@ class DeepgramSTTProvider(BaseSTTProvider):
                 # the next utterance rather than logging a scary traceback.
                 await asyncio.sleep(0.5)
                 continue
+            except InvalidStatus as exc:
+                # Auth/model/config problems won't heal by retrying - fail fast
+                # with an actionable error instead of an endless reconnect loop.
+                self.logger.error("Deepgram rejected connection (check DEEPGRAM_API_KEY / STT_MODEL): %s", exc)
+                raise RuntimeError(f"Deepgram connection rejected: {exc}") from exc
             except Exception as exc:
                 self.logger.exception("Deepgram connection failed: %s", exc)
                 await asyncio.sleep(backoff)

@@ -7,30 +7,9 @@ single, bounded request so external AI projects can call them over plain HTTP
 from __future__ import annotations
 
 import asyncio
-import os
 import uuid
 
-from .providers import (
-    MockSTTProvider,
-    DeepgramSTTProvider,
-    MockTTSProvider,
-    EdgeTTSProvider,
-)
-
-
-def build_stt_provider():
-    if os.environ.get("DEEPGRAM_API_KEY"):
-        return DeepgramSTTProvider(
-            model=os.environ.get("STT_MODEL", "nova-2-general") or "nova-2-general"
-        )
-    return MockSTTProvider()
-
-
-def build_tts_provider():
-    prov = os.environ.get("TTS_PROVIDER", "").lower()
-    if prov in ("edge", "edge-tts"):
-        return EdgeTTSProvider(voice=os.environ.get("TTS_VOICE", "en-US-AriaNeural"))
-    return MockTTSProvider()
+from .providers import build_stt_provider, build_tts_provider  # noqa: F401  (re-exported for convenience)
 
 
 async def transcribe_once(data: bytes, stt_provider=None) -> str:
