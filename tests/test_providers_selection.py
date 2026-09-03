@@ -8,6 +8,7 @@ from voice_engine.providers import (
     DeepgramTTSProvider,
     MockSTTProvider,
     MockTTSProvider,
+    clean_spoken_text,
     build_stt_provider,
     build_tts_provider,
 )
@@ -170,3 +171,76 @@ async def test_aura_skips_empty_input(clean_env, monkeypatch, fake_http):
 def test_aura_fails_fast_without_key(clean_env):
     with pytest.raises(RuntimeError, match="DEEPGRAM_API_KEY"):
         DeepgramTTSProvider()
+
+
+# ------------------------------------------------------- spoken-text cleaning
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # The exact case from the bug report: "- ** test **" -> "test".
+        ("- ** test **", "test"),
+        ("**bold**", "bold"),
+        ("__bold__", "bold"),
+        ("*italic*", "italic"),
+        ("_italic_", "italic"),
+        ("`code`", "code"),
+        ("~~strike~~", "strike"),
+        ("Mixed **bold** and *italic* text", "Mixed bold and italic text"),
+        # Plain text is left untouched.
+        ("Hello world", "Hello world"),
+        # Whitespace-only collapses to empty (so the provider skips it).
+        ("   ", ""),
+        ("", ""),
+        (None, None),
+        # Heading / blockquote / bullet prefixes at line start are dropped.
+        ("# Heading", "Heading"),
+        ("> quoted", "quoted"),
+        ("- bullet item", "bullet item"),
+        # Lone/unbalanced asterisks are stripped, not spoken.
+        ("5 * 3 = 15", "5 3 = 15"),
+    ],
+)
+def test_clean_spoken_text_strips_markdown(raw, expected):
+    assert clean_spoken_text(raw) == expected
+
+
+@pytest.mark.asyncio
+async def test_aura_strips_markdown_before_sending(clean_env, monkeypatch, fake_http):
+    """Markdown markers in the answer must be removed before hitting the TTS API."""
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "test-key")
+    p = DeepgramTTSProvider()
+
+    chunks = [c async for c in p.synthesize(_text_iter("**bold** and *italic*"), "resp")]
+
+    assert len(chunks) == 1
+    assert chunks[0].data == b"AURA_MP3_BYTES"
+    url, kw = FakeAsyncClient.calls[0]
+    assert url == DeepgramTTSProvider.API_URL
+    # The asterisks themselves must never be sent to Deepgram.
+    assert kw["json"]["text"] == "bold and italic"
+    assert "*" not in kw["json"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_aura_strips_leading_marker_and_bold(clean_env, monkeypatch, fake_http):
+    """The reported input ``- ** test **`` must be spoken as just ``test``."""
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "test-key")
+    p = DeepgramTTSProvider()
+
+    [c async for c in p.synthesize(_text_iter("- ** test **"), "resp")]
+
+    _, kw = FakeAsyncClient.calls[0]
+    assert kw["json"]["text"] == "test"
+
+
+@pytest.mark.asyncio
+async def test_mock_tts_strips_markdown(clean_env):
+    """MockTTSProvider must also never emit raw asterisks in its fake audio."""
+    p = MockTTSProvider()
+    # MockTTSProvider cleans each incoming chunk independently (no joining),
+    # so every chunk gets its own AUDIO(...) frame.
+    chunks = [c async for c in p.synthesize(_text_iter("- ** test **", "extra **hi**"), "resp")]
+    texts = [c.data.decode("utf-8") for c in chunks]
+    assert texts == ["AUDIO(test)", "AUDIO(extra hi)"]
+    assert "*" not in "".join(texts)

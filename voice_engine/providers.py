@@ -1,6 +1,7 @@
 """Provider abstractions and lightweight mocks for STT/LLM/TTS streaming."""
 from __future__ import annotations
 import asyncio
+import re
 import uuid
 from typing import AsyncIterator, Dict, Any, Optional
 import os
@@ -32,6 +33,51 @@ class AudioChunk:
         self.response_id = response_id
         self.sequence = sequence
         self.data = data
+
+
+def clean_spoken_text(text: str) -> str:
+    """Strip Markdown/markup markers so the TTS engine never *speaks* them.
+
+    Voice synthesis engines literally read out punctuation such as
+    asterisks, underscores and backticks -- e.g. a Markdown ``" **bold** "``
+    sentence is spoken as "asterisk asterisk bold asterisk asterisk". This
+    normalises text for *speech* only: it removes the formatting markers
+    while preserving the readable word content.
+
+    NOTE: this is intentionally speech-only. Display/markup text returned to
+    the browser (e.g. ``llm.delta`` websocket frames) is left untouched so the
+    UI can still render Markdown.
+    """
+    if not text:
+        return text
+
+    # 1. Bold -- run before italic so `**` pairs are consumed first.
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+
+    # 2. Italic / emphasis.
+    text = re.sub(r"\*(.+?)\*", r"\1", text)
+    text = re.sub(r"_(.+?)_", r"\1", text)
+
+    # 3. Inline code -> code.
+    text = re.sub(r"`(.+?)`", r"\1", text)
+
+    # 4. Strikethrough.
+    text = re.sub(r"~~(.+?)~~", r"\1", text)
+
+    # 5. Headings / blockquotes / bullets at line start.
+    text = re.sub(r"^\s*#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*>\s?", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-*+]\s+", " ", text, flags=re.MULTILINE)
+
+    # 6. Any stray asterisks/underscores/backticks left behind (e.g. unbalanced).
+    text = text.replace("*", "").replace("_", "").replace("`", "")
+
+    # 7. Collapse the whitespace left behind by the removals.
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
 
 
 class BaseSTTProvider:
@@ -92,6 +138,10 @@ class MockTTSProvider(BaseTTSProvider):
     async def synthesize(self, text_iter: AsyncIterator[str], response_id: str) -> AsyncIterator[AudioChunk]:
         seq = 0
         async for chunk in text_iter:
+            # Strip Markdown/markup markers so the mock never "speaks" asterisks etc.
+            chunk = clean_spoken_text(chunk)
+            if not chunk:
+                continue
             # pretend to synthesize chunk into audio
             await asyncio.sleep(0.1)
             data = f"AUDIO({chunk})".encode("utf-8")
@@ -206,7 +256,7 @@ class EdgeTTSProvider(BaseTTSProvider):
         parts = []
         async for chunk in text_iter:
             parts.append(chunk)
-        text = "".join(parts).strip()
+        text = clean_spoken_text("".join(parts))
         if not text:
             return
         communicate = Communicate(text, voice=self.voice, rate=self.rate, volume=self.volume)
@@ -258,7 +308,7 @@ class DeepgramTTSProvider(BaseTTSProvider):
         parts = []
         async for chunk in text_iter:
             parts.append(chunk)
-        text = "".join(parts).strip()
+        text = clean_spoken_text("".join(parts))
         if not text:
             return
 
