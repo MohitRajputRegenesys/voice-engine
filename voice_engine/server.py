@@ -10,6 +10,8 @@ from .session import Session
 from .state import SessionState
 from .providers import build_tts_provider
 from .rest import transcribe_once, synthesize_once
+from .twilio.media_stream import router as twilio_media_stream_router
+from .twilio.routes import router as twilio_router
 
 for env_path in (Path(__file__).resolve().parent.parent / ".env", Path(__file__).resolve().parent.parent / "env"):
     if env_path.exists():
@@ -136,3 +138,7 @@ async def _heartbeat(ws: WebSocket, session: Session):
                 break
     except asyncio.CancelledError:
         return
+
+# Include the Twilio calling feature routers (media stream WS + webhooks/outbound API).
+app.include_router(twilio_media_stream_router)
+app.include_router(twilio_router)

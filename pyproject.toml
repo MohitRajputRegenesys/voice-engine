@@ -8,11 +8,13 @@ dependencies = [
     # Minimal core runtime of the SDK (voice_engine.client) so consumer AI
     # projects can install this package without pulling in the server stack.
     "httpx>=0.24.0",
+    "twilio>=9.11.0",
     "websockets>=12.0",
 ]
 
 [project.optional-dependencies]
-# Voice-gateway server stack (FastAPI app + provider implementations).
+# Voice-gateway server stack (FastAPI app + provider implementations) +
+# the Twilio calling feature (TwiML, webhook signature validation, REST triggers).
 server = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.22.0",
@@ -20,6 +22,8 @@ server = [
     "pydantic>=2.5",
     "python-dotenv>=1.0.1",
     "edge-tts>=6.1.0",
+    "python-multipart>=0.0.9",
+    "twilio>=9.0.0",
 ]
 
 [dependency-groups]

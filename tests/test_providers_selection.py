@@ -1,6 +1,7 @@
 """Provider selection matrix + Deepgram Aura TTS unit tests (fully mocked)."""
 import httpx
 import pytest
+from urllib.parse import parse_qs, urlparse
 
 from voice_engine.providers import (
     EdgeTTSProvider,
@@ -12,6 +13,10 @@ from voice_engine.providers import (
     build_stt_provider,
     build_tts_provider,
 )
+
+
+def _query_params(url: str) -> dict:
+    return parse_qs(urlparse(url).query)
 
 
 @pytest.fixture
@@ -29,12 +34,28 @@ def test_stt_deepgram_when_key_set(clean_env, monkeypatch):
     monkeypatch.setenv("DEEPGRAM_API_KEY", "test-key")
     p = build_stt_provider()
     assert isinstance(p, DeepgramSTTProvider)
-    assert p.model == "nova-2"          # fixed fallback (was invalid nova-2-general)
+    assert p.model == "nova-3"          # nova-2 is rejected by Deepgram with HTTP 400
     assert p.sample_rate == 16000
 
     monkeypatch.setenv("STT_LANGUAGE", "en-US")
     p = build_stt_provider()
     assert p.language == "en-US"
+
+
+def test_stt_request_url_matches_working_reference(clean_env, monkeypatch):
+    """Browser STT must request the proven-working model (nova-3).
+
+    ``model=nova-2`` is deprecated and rejected by Deepgram with HTTP 400 on
+    newer accounts — the same model the reference calling agent uses.
+    """
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "test-key")
+    p = build_stt_provider()
+    q = _query_params(p.build_request_url())
+    assert q["model"] == ["nova-3"]
+    assert q["encoding"] == ["linear16"]
+    assert q["sample_rate"] == ["16000"]
+    assert q["smart_format"] == ["true"]
+    assert "language" not in q
 
 
 def test_stt_mock_without_key(clean_env):
