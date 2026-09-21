@@ -199,7 +199,8 @@ class FacilitatorLLMProvider(BaseLLMProvider):
         import httpx
 
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=60.0)
+            timeout = float(os.environ.get("FACILITATOR_TIMEOUT", "15") or 15)
+            self._client = httpx.AsyncClient(timeout=timeout)
         return self._client
 
     async def stream_response(self, prompt: str, response_id: str) -> AsyncIterator[LLMDelta]:
@@ -219,7 +220,25 @@ class FacilitatorLLMProvider(BaseLLMProvider):
             if self.session_id:
                 payload["session_id"] = self.session_id
 
-        resp = await self._get_client().post(f"{self.base_url}{self.api_path}", json=payload)
+        self.logger.info(
+            "RAG request starting: url=%s prompt_length=%s session_id=%s",
+            f"{self.base_url}{self.api_path}",
+            len(prompt),
+            bool(self.session_id),
+        )
+        self.logger.info("RAG PROMPT: %s", prompt)
+        try:
+            resp = await self._get_client().post(
+                f"{self.base_url}{self.api_path}", json=payload
+            )
+        except httpx.HTTPError as exc:
+            self.logger.exception("RAG request failed: %s", exc)
+            yield LLMDelta(
+                response_id=response_id,
+                sequence=0,
+                text="I'm sorry, I could not retrieve an answer right now.",
+            )
+            return
         if resp.status_code != 200:
             self.logger.error("RAG backend returned %s: %s", resp.status_code, resp.text[:300])
             yield LLMDelta(
@@ -231,6 +250,13 @@ class FacilitatorLLMProvider(BaseLLMProvider):
         data = resp.json()
         self.session_id = data.get("session_id", self.session_id)
         answer = data.get("answer", "") or ""
+        self.logger.info(
+            "RAG response received: status=%s answer_length=%s session_id=%s",
+            resp.status_code,
+            len(answer),
+            bool(self.session_id),
+        )
+        self.logger.info("RAG ANSWER: %s", answer or "<empty answer>")
         # commit the turn to the local history (mirrors the backend session)
         self.history.append({"role": "student", "content": prompt})
         self.history.append({"role": "teacher", "content": answer})
@@ -634,6 +660,15 @@ class DeepgramSTTProvider(BaseSTTProvider):
             raise RuntimeError("DEEPGRAM_API_KEY not set in environment")
 
         url = self.build_request_url()
+        self.logger.info(
+            "Deepgram STT starting: model=%s encoding=%s sample_rate=%s channels=%s endpointing=%s utterance_end_ms=%s",
+            self.model,
+            self.encoding,
+            self.sample_rate,
+            self.channels or 1,
+            self.endpointing_ms,
+            self.utterance_end_ms,
+        )
 
         backoff = 1.0
         sequence = 0
@@ -641,12 +676,21 @@ class DeepgramSTTProvider(BaseSTTProvider):
             try:
                 headers = {"Authorization": f"Token {self.api_key}"}
                 async with websockets.connect(url, additional_headers=headers, ping_interval=20) as ws:
-                    self.logger.info("Deepgram websocket connected")
+                    self.logger.info("Deepgram websocket connected: url=%s", url)
+                    sent_audio = 0
+                    sent_bytes = 0
+                    first_audio_logged = False
 
                     async def sender():
+                        nonlocal sent_audio, sent_bytes, first_audio_logged
                         while True:
                             data = await audio_queue.get()
                             if data is None:
+                                self.logger.info(
+                                    "Deepgram STT sender stopping: queue sentinel, audio_frames=%s audio_bytes=%s",
+                                    sent_audio,
+                                    sent_bytes,
+                                )
                                 try:
                                     await ws.send(json.dumps({"type": "CloseStream"}))
                                 except Exception:
@@ -660,10 +704,34 @@ class DeepgramSTTProvider(BaseSTTProvider):
                                     await ws.send(json.dumps({"type": "CloseStream"}))
                                 except ConnectionClosedError:
                                     pass
+                                self.logger.info(
+                                    "Deepgram STT sender stopping: end marker, audio_frames=%s audio_bytes=%s",
+                                    sent_audio,
+                                    sent_bytes,
+                                )
                                 return
                             try:
                                 await ws.send(data)
+                                sent_audio += 1
+                                sent_bytes += len(data)
+                                if not first_audio_logged:
+                                    first_audio_logged = True
+                                    self.logger.info(
+                                        "Deepgram STT first audio sent: bytes=%s",
+                                        len(data),
+                                    )
+                                elif sent_audio % 100 == 0:
+                                    self.logger.info(
+                                        "Deepgram STT audio flowing: frames=%s bytes=%s",
+                                        sent_audio,
+                                        sent_bytes,
+                                    )
                             except ConnectionClosedError:
+                                self.logger.warning(
+                                    "Deepgram STT sender saw websocket close: audio_frames=%s audio_bytes=%s",
+                                    sent_audio,
+                                    sent_bytes,
+                                )
                                 return
 
                     send_task = asyncio.create_task(sender())
@@ -694,8 +762,18 @@ class DeepgramSTTProvider(BaseSTTProvider):
                                 continue
 
                             if is_final:
+                                self.logger.info(
+                                    "Deepgram STT final transcript: sequence=%s text_length=%s",
+                                    sequence,
+                                    len(transcript_text or ""),
+                                )
                                 yield STTEvent(response_id=str(uuid.uuid4()), sequence=sequence, final=transcript_text)
                             else:
+                                self.logger.info(
+                                    "Deepgram STT partial transcript: sequence=%s text_length=%s",
+                                    sequence,
+                                    len(transcript_text or ""),
+                                )
                                 yield STTEvent(response_id=str(uuid.uuid4()), sequence=sequence, partial=transcript_text)
                             sequence += 1
                     finally:
@@ -704,9 +782,19 @@ class DeepgramSTTProvider(BaseSTTProvider):
                             await send_task
                         except asyncio.CancelledError:
                             pass
-            except ConnectionClosed:
+                        self.logger.info(
+                            "Deepgram STT websocket stream ended: audio_frames=%s audio_bytes=%s",
+                            sent_audio,
+                            sent_bytes,
+                        )
+            except ConnectionClosed as exc:
                 # Normal end-of-stream after CloseStream; reconnect quietly for
                 # the next utterance rather than logging a scary traceback.
+                self.logger.warning(
+                    "Deepgram STT websocket closed: code=%s reason=%s; reconnecting",
+                    getattr(exc, "code", "?"),
+                    getattr(exc, "reason", ""),
+                )
                 await asyncio.sleep(0.5)
                 continue
             except InvalidStatus as exc:
@@ -726,7 +814,11 @@ class DeepgramSTTProvider(BaseSTTProvider):
                     "parameters (url logged above)."
                 ) from exc
             except Exception as exc:
-                self.logger.exception("Deepgram connection failed: %s", exc)
+                self.logger.exception(
+                    "Deepgram connection failed; reconnecting in %.1fs: %s",
+                    backoff,
+                    exc,
+                )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
                 continue

@@ -1,10 +1,13 @@
 """FastAPI WebSocket server exposing realtime voice session endpoint."""
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import asyncio
 import base64
+import logging
+import os
 from pathlib import Path
 from .session import Session
 from .state import SessionState
@@ -12,12 +15,82 @@ from .providers import build_tts_provider
 from .rest import transcribe_once, synthesize_once
 from .twilio.media_stream import router as twilio_media_stream_router
 from .twilio.routes import router as twilio_router
+from .asterisk.routes import router as asterisk_router
+from .asterisk.calls import asterisk_call_manager
+from .asterisk.config import get_settings as get_asterisk_settings
 
 for env_path in (Path(__file__).resolve().parent.parent / ".env", Path(__file__).resolve().parent.parent / "env"):
     if env_path.exists():
         load_dotenv(env_path)
 
-app = FastAPI()
+
+def _configure_logging() -> None:
+    """Give the ``voice_engine`` loggers a console handler.
+
+    Uvicorn only configures its own loggers, so without this every
+    ``voice_engine.*`` INFO record (call lifecycle, media transport, STT/LLM/TTS)
+    was silently dropped -- which makes a live call impossible to debug.
+    Uvicorn keeps its own handlers; ``basicConfig`` only adds a root handler
+    when none exists yet.
+    """
+    level = os.getenv("LOG_LEVEL", "INFO").upper()
+    class DiagnosticFormatter(logging.Formatter):
+        def format(self, record):
+            for field in ("channel_id", "turn", "state", "queue_depth"):
+                if not hasattr(record, field):
+                    setattr(record, field, "-")
+            return super().format(record)
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        DiagnosticFormatter(
+            "%(asctime)s %(levelname)s %(name)s "
+            "[channel=%(channel_id)s turn=%(turn)s state=%(state)s queue=%(queue_depth)s]: %(message)s"
+        )
+    )
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level, logging.INFO))
+    if not root.handlers:
+        root.addHandler(handler)
+    else:
+        for existing in root.handlers:
+            existing.setFormatter(handler.formatter)
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+    )
+
+
+_configure_logging()
+
+
+async def _start_asterisk_integration() -> None:
+    """Connect to Asterisk ARI at startup when ASTERISK_ENABLED=true.
+
+    Never raises: a missing/unreachable Asterisk must not take the gateway
+    down (the events websocket keeps retrying with backoff; REST calls fail
+    per-request and surface as 502/503 from the API).
+    """
+    settings = get_asterisk_settings()
+    if not settings.enabled:
+        return
+    try:
+        await asterisk_call_manager.start()
+    except Exception as exc:  # noqa: BLE001 - startup must never crash
+        logging.getLogger("voice_engine.server").error(
+            "Asterisk/3CX integration failed to start: %s", exc
+        )
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await _start_asterisk_integration()
+    try:
+        yield
+    finally:
+        await asterisk_call_manager.stop()
+
+
+app = FastAPI(lifespan=lifespan)
 
 connections = {}
 
@@ -142,3 +215,8 @@ async def _heartbeat(ws: WebSocket, session: Session):
 # Include the Twilio calling feature routers (media stream WS + webhooks/outbound API).
 app.include_router(twilio_media_stream_router)
 app.include_router(twilio_router)
+
+# Include the 3CX/Asterisk calling feature (ARI + ExternalMedia RTP).
+# Disabled unless ASTERISK_ENABLED=true -- dev machines without Asterisk are
+# completely unaffected and all Twilio endpoints keep working unchanged.
+app.include_router(asterisk_router)

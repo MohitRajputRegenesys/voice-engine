@@ -194,6 +194,90 @@ speaking during the gap, the music stops immediately. Configure via:
 The built-in pad is procedurally synthesized (royalty-free by construction) and
 loops sample-exact seamlessly.
 
+## 3CX calling via Asterisk (ARI + ExternalMedia)
+
+The engine can also run a full **phone call through your own 3CX PBX**, using
+a local **Asterisk** gateway as the SIP/media engine. The Twilio feature above
+stays fully intact -- both backends can run side by side.
+
+```
+voice-engine ── ARI (HTTP :8088 + WS /ari/events) ──► Asterisk
+                                                         │ SIP REGISTER (ext 900)
+                                                         ▼
+                              3CX ── outbound rule ──► Airtel ──► customer phone
+```
+
+- **Outbound**: `POST /api/threecx/calls/outbound` → ARI create+dial
+  `PJSIP/3cx/<digits>` → 3CX matches its outbound rule for extension 900 → Airtel.
+  On answer the engine bridges the call to an ExternalMedia channel and runs the
+  same STT → RAG LLM → TTS pipeline as the Twilio path (8 kHz mu-law, hold music,
+  instant RMS barge-in).
+- **Inbound**: 3CX routes a DID to extension 900 → Asterisk dialplan
+  `Stasis(voice-engine,inbound)` → the AI answers.
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /api/threecx/calls/outbound` | Outbound call trigger (X-API-Key; alias `/api/asterisk/calls/outbound`) |
+| `GET /api/threecx/status` | Integration health + active calls (alias `/api/asterisk/status`) |
+| `GET /api/threecx/calls` | Active call list with lifecycle state |
+| `POST /api/threecx/calls/{channel_id}/hangup` | Hang up an active call |
+
+```bash
+curl -X POST localhost:8001/api/threecx/calls/outbound \
+     -H 'Content-Type: application/json' -H 'X-API-Key: secret-api-key' \
+     -d '{"phone": "+919876543210"}'
+```
+
+### Media transport
+
+`ASTERISK_MEDIA_TRANSPORT` selects how Asterisk hands us call audio:
+
+| Value | Wire | Notes |
+|-------|------|-------|
+| `audiosocket` (default) | TCP, 3-byte header frames | The only external-media combination Asterisk 18/20/21 actually implements. Verified end-to-end against Asterisk 20.21.0. |
+| `rtp` | UDP, UnicastRTP/RTP | Latching + 20 ms pacing; use when the deployment supports it. |
+
+AudioSocket protocol note (verified live): Asterisk sends **its** call-UUID frame
+to us on connect and `res_audiosocket` rejects any UUID frame coming back
+("Received AudioSocket message other than hangup or audio" → channel fails →
+call drops). The engine therefore records the peer UUID and only ever sends
+`AUDIO`/`HANGUP` frames. Audio payloads are 8 kHz raw mu-law, one frame per
+20 ms by default (`ASTERISK_FRAME_MS`).
+
+### Configuration
+
+Disabled by default; set `ASTERISK_ENABLED=true` plus the `ARI_*` / `THREECX_*`
+/ `ASTERISK_*` block in `.env.example`. Ready-to-adapt Asterisk configuration
+(`pjsip.conf` registration as extension 900, `http.conf`/`ari.conf` for ARI,
+dialplan for inbound, RTP range) and the full milestone runbook live in
+**`asterisk-config/README.md`**. Keep Asterisk + 3CX + the engine on the same
+LAN/VPN and never expose SIP/ARI/RTP ports to the internet.
+
+When Asterisk runs in Docker on the same host as this engine, the engine listens
+on `ASTERISK_MEDIA_BIND_IP=0.0.0.0` and Asterisk dials back to
+`ASTERISK_MEDIA_HOST=host.docker.internal`; publish ARI as
+`127.0.0.1:8088:8088` so it is reachable from the host only.
+
+Verify the wiring before dialling:
+
+```bash
+GET  /api/threecx/status                 # → {"connected": true, ...}
+docker exec asterisk-test asterisk -rx "pjsip show registrations"   # 3cx-reg  Registered
+docker exec asterisk-test asterisk -rx "ari show apps"              # voice-engine
+```
+
+`ASTERISK_MEDIA_HOST` must be the address of the machine running the engine
+**as reachable from Asterisk**. With the `rtp` transport Asterisk streams there
+and return audio is latched to its RTP source (or pinned via
+`ASTERISK_MEDIA_REMOTE_ADDR/PORT`). `ASTERISK_MEDIA_FORMAT` supports `ulaw`
+(default), `alaw` and `slin16` -- conversion happens only at the transport
+boundary, the AI pipeline always runs mu-law.
+
+Lifecycle as seen on a live outbound call: `DIALING → RINGING → ANSWERED →
+WELCOME → LISTENING → THINKING/SPEAKING → …`. Greeting guards on the telephony
+states as well as `NEW`, because an outbound leg is already `ANSWERED` when the
+media bridge is built.
+
 ## Tests
 
 ```bash
@@ -204,3 +288,12 @@ Unit tests are fully mocked (no network/key required); use `smoke_live.py` to
 verify your real credentials.
 
 
+<!-- ***************** -->
+
+.venv\Scripts\python.exe -m uvicorn voice_engine.server:app --host 127.0.0.1 --port 8001
+
+
+curl --location 'http://127.0.0.1:8001/api/threecx/calls/outbound' \
+--header 'Content-Type: application/json' \
+--header 'X-API-Key: secret-api-key' \
+--data '{"phone":"0730825043"}'
