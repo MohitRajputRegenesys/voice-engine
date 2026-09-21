@@ -11,3 +11,4 @@ srv.err
 srv.out
 .ruff_cache/
 uv.lock
+tests/
