@@ -1,0 +1,34 @@
+
+services:
+  voice-engine:
+    container_name: voice-engine
+    build:
+      context: .
+    image: voice-engine:0.2.0
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      ARI_BASE_URL: http://asterisk-test:8088
+      ASTERISK_MEDIA_HOST: voice-engine
+      ASTERISK_MEDIA_BIND_IP: 0.0.0.0
+      ASTERISK_MEDIA_PORT: "0"
+      FACILITATOR_API_URL: http://host.docker.internal:8000
+      TWILIO_HOLD_MUSIC_FILE: /app/hold_music.wav
+      ASTERISK_HOLD_MUSIC_FILE: /app/hold_music.wav
+      LOG_LEVEL: INFO
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    ports:
+      - "127.0.0.1:8001:8001"
+
+    networks:
+      - asterisk-net
+
+networks:
+  asterisk-net:
+    external: true
+    name: asterisk-3cx_default

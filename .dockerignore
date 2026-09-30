@@ -1,0 +1,24 @@
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+uv.lock
+
+# Local secrets — injected at runtime via docker-compose `env_file: .env`,
+# never baked into the image.
+.env
+
+# Local tooling / runtime artefacts not needed in the image
+.git/
+.gitignore
+srv.out
+srv.err
+smoke_tts.mp3
+*.log
+tests/
+*.md
+!README.md

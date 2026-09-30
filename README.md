@@ -288,6 +288,56 @@ Unit tests are fully mocked (no network/key required); use `smoke_live.py` to
 verify your real credentials.
 
 
+## Run in Docker (gateway + 3CX/Asterisk media)
+
+The engine ships a `Dockerfile` and `docker-compose.yml`. The Asterisk side
+(`d:\tg-imp\asterisk-3cx`) is left untouched — the engine container just joins
+the bridge network that stack already created, so the two containers resolve
+each other **by name** and no media ports need publishing (`ASTERISK_MEDIA_PORT=0`
+still picks a fresh AudioSocket port per call, so concurrent calls keep working).
+
+```powershell
+# 1. Asterisk first (skip if asterisk-test is already up)
+cd d:\tg-imp\asterisk-3cx
+docker compose up -d
+
+# 2. The engine
+cd d:\tg-imp\saleKnowledgeBase\voice-engine
+docker compose config            # optional: review the merged environment
+docker compose build
+docker compose up -d
+docker compose logs -f voice-engine   # expect: "ARI events websocket connected (app=voice-engine)"
+```
+
+`env_file: .env` supplies every credential/tuning value you already use; only
+these change because they are host-local in a non-Docker run:
+
+| Variable | Host value | Container value | Why |
+|----------|-----------|-----------------|-----|
+| `ARI_BASE_URL` | `http://127.0.0.1:8088` | `http://asterisk-test:8088` | Asterisk is reached by container name on the shared bridge |
+| `ASTERISK_MEDIA_HOST` | `host.docker.internal` | `voice-engine` | Asterisk dials AudioSocket back to this container |
+| `ASTERISK_MEDIA_PORT` | `0` | `0` | dynamic port per call — reachable without publishing |
+| `FACILITATOR_API_URL` | `http://localhost:8000` | `http://host.docker.internal:8000` | the RAG brain still runs natively on the host |
+| `TWILIO_HOLD_MUSIC_FILE` | `D:\...\hold_music.wav` | `/app/hold_music.wav` | Windows path; the WAV is baked into the image |
+
+Engine HTTP/WS is published **host-loopback only** (`127.0.0.1:8001`), so the
+ngrok agent, the saleKnowledgeBase backend (`VOICE_ENGINE_URL=http://localhost:8001`)
+and `curl` behave exactly as before, and nothing is exposed to the LAN.
+
+```powershell
+curl.exe -s http://localhost:8001/api/threecx/status              # -> "connected": true
+docker exec asterisk-test asterisk -rx "ari show apps"            # -> voice-engine
+docker exec voice-engine python -c "import urllib.request;print(urllib.request.urlopen('http://host.docker.internal:8000/health').read().decode())"
+```
+
+| Symptom | Fix |
+|---------|-----|
+| `ari show apps` empty / status `"connected": false` | Asterisk down, or `ASTERISK_ENABLED=true` missing — check `docker compose logs voice-engine` |
+| Call connects, no audio | `ASTERISK_MEDIA_HOST` must be `voice-engine` and both containers must share `asterisk-3cx_default` (`docker network inspect asterisk-3cx_default`) |
+| Facilitator unreachable (`Network is unreachable` / refused) | start the host backend, then re-run the `urllib` check above; on Linux (Docker Engine) the host service must bind `0.0.0.0`, because `host.docker.internal` maps to the bridge gateway there |
+| Changed an env value, nothing happened | recreate the container: `docker compose up -d --force-recreate` |
+| Never scale | the call registry, ARI events websocket and AudioSocket listeners are in-process: one replica, no `--workers` |
+
 <!-- ***************** -->
 
 .venv\Scripts\python.exe -m uvicorn voice_engine.server:app --host 127.0.0.1 --port 8001
